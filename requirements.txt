@@ -1,5 +1,4 @@
-mcp[cli]
+anthropic
+boto3
 python-dotenv
-openai
-ipykernel
-httpx
+mcp

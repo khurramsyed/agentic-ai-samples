@@ -1,154 +1,56 @@
 import asyncio
 import os
-import traceback
-
-from typing import Optional
-from contextlib import AsyncExitStack
-
-from mcp import ClientSession, Tool
-from mcp.client.sse import sse_client
-
-from anthropic import Anthropic
+from typing import List
 from dotenv import load_dotenv
 
+from ai_models import AnthropicModel, BedrockModel
+from mcp_manager import MCPManager, MCPServerConfig
+from query_processor import QueryProcessor
+from chat_interface import ChatInterface
 
-
-load_dotenv()  # load environment variables from .env
+load_dotenv()
 
 class MCPClient:
-    def __init__(self):
-        # Initialize session and client objects
-        self.session: Optional[ClientSession] = None
-        self.exit_stack = AsyncExitStack()
-        self.anthropic = Anthropic()
-        self.tools: Optional[List[Tool]] = None
-        load_dotenv()
-
-    # methods will go here
-
-
-    async def connect_to_server(self):
-        """Connect to an MCP server
-        """
-
-        sse_transport = await self.exit_stack.enter_async_context(sse_client(os.getenv("MCP_SERVER")))
-        self.sse, self.write = sse_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.sse, self.write))
-
-        await self.session.initialize()
-
-       
-
-
-
-
-    async def cleanup(self):
-        """Clean up resources"""
-        await self.exit_stack.aclose()
-
-    async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
-        messages = [
-            {
-                "role": "user",
-                "content": query
-            }
-        ]
-
-        response = await self.session.list_tools()
-        available_tools = [{
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
-        } for tool in response.tools]
-
-        print(available_tools)
-
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            messages=messages,
-            tools=available_tools
-        )
-
-        # Process response and handle tool calls
-        final_text = []
-
-        assistant_message_content = []
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-                assistant_message_content.append(content)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
-
-                # Execute tool call
-                result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-
-                assistant_message_content.append(content)
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_message_content
-                })
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": content.id,
-                            "content": result.content
-                        }
-                    ]
-                })
-
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-haiku-20240307",
-                    max_tokens=1000,
-                    messages=messages,
-                    tools=available_tools
-                )
-
-                final_text.append(response.content[0].text)
-
-        return "\n".join(final_text)
+    def __init__(self, model_provider: str = "anthropic", aws_region: str = "us-east-1"):
+        self.mcp_manager = MCPManager()
+        
+        if model_provider == "anthropic":
+            self.ai_model = AnthropicModel()
+        else:
+            self.ai_model = BedrockModel(aws_region)
+        
+        self.query_processor = QueryProcessor(self.ai_model, self.mcp_manager)
+        self.chat_interface = ChatInterface(self.query_processor)
     
-
+    async def connect_to_servers(self, server_configs: List[dict] = None):
+        if server_configs is None:
+            server_configs = [{"name": "default", "url": os.getenv("MCP_SERVER")}]
+        
+        configs = [MCPServerConfig(cfg["name"], cfg["url"]) for cfg in server_configs]
+        await self.mcp_manager.connect_servers(configs)
+    
     async def chat_loop(self):
-        """Run an interactive chat loop"""
-        print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
-
-        while True:
-            try:
-                query = input("\nQuery: ").strip()
-
-                if query.lower() == 'quit':
-                    break
-
-                response = await self.process_query(query)
-                print("\n" + response)
-
-            except Exception as e:
-                print(f"\nError: {str(e.with_traceback)}")
-                traceback.print_exec()
-
+        await self.chat_interface.run_chat_loop()
+    
     async def cleanup(self):
-        """Clean up resources"""
-        await self.exit_stack.aclose()
+        await self.mcp_manager.cleanup()
 
 async def main():
-    client = MCPClient()
+    server_configs = None 
+    #[
+    #    {"name": "server1", "url": os.getenv("MCP_SERVER_1", "sse://localhost:3001")},
+    #    {"name": "server2", "url": os.getenv("MCP_SERVER_2", "sse://localhost:3002")}
+    #]
+
+    
+    #client = MCPClient(model_provider="bedrock", aws_region="us-east-1")
+    
+    client = MCPClient(model_provider="anthropic")
     try:
-        await client.connect_to_server()
+        await client.connect_to_servers(server_configs)
         await client.chat_loop()
-        
     finally:
         await client.cleanup()
 
 if __name__ == "__main__":
-    import sys
     asyncio.run(main())
